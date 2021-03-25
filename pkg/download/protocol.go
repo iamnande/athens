@@ -42,7 +42,15 @@ type Opts struct {
 	Stasher      stash.Stasher
 	Lister       module.UpstreamLister
 	DownloadFile *mode.DownloadFile
+	// NetworkMode  string
 }
+
+// NetworkMode constants
+const (
+	Strict   = "strict"
+	Offline  = "offline"
+	Fallback = "fallback"
+)
 
 // New returns a full implementation of the download.Protocol
 // that the proxy needs. New also takes a variadic list of wrappers
@@ -53,7 +61,7 @@ func New(opts *Opts, wrappers ...Wrapper) Protocol {
 	if opts.DownloadFile == nil {
 		opts.DownloadFile = &mode.DownloadFile{Mode: mode.Sync}
 	}
-	var p Protocol = &protocol{opts.DownloadFile, opts.Storage, opts.Stasher, opts.Lister}
+	var p Protocol = &protocol{opts.DownloadFile, opts.Storage, opts.Stasher, opts.Lister, "TODO"}
 	for _, w := range wrappers {
 		p = w(p)
 	}
@@ -62,10 +70,11 @@ func New(opts *Opts, wrappers ...Wrapper) Protocol {
 }
 
 type protocol struct {
-	df      *mode.DownloadFile
-	storage storage.Backend
-	stasher stash.Stasher
-	lister  module.UpstreamLister
+	df          *mode.DownloadFile
+	storage     storage.Backend
+	stasher     stash.Stasher
+	lister      module.UpstreamLister
+	networkMode string
 }
 
 func (p *protocol) List(ctx context.Context, mod string) ([]string, error) {
@@ -76,17 +85,20 @@ func (p *protocol) List(ctx context.Context, mod string) ([]string, error) {
 	var strList, goList []string
 	var sErr, goErr error
 	var wg sync.WaitGroup
-	wg.Add(2)
 
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		strList, sErr = p.storage.List(ctx, mod)
 	}()
 
-	go func() {
-		defer wg.Done()
-		_, goList, goErr = p.lister.List(ctx, mod)
-	}()
+	if p.networkMode != Offline {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, goList, goErr = p.lister.List(ctx, mod)
+		}()
+	}
 
 	wg.Wait()
 
@@ -99,12 +111,14 @@ func (p *protocol) List(ctx context.Context, mod string) ([]string, error) {
 	// if i.e. github is unavailable we should fail as well so that the behavior of the proxy is stable.
 	// otherwise we will get different results the next time because i.e. GH is up again
 	isUnexpGoErr := goErr != nil && !errors.IsRepoNotFoundErr(goErr)
-	if isUnexpGoErr {
+	if isUnexpGoErr && p.networkMode == Strict {
 		return nil, errors.E(op, goErr)
 	}
 
 	isRepoNotFoundErr := goErr != nil && errors.IsRepoNotFoundErr(goErr)
 	storageEmpty := len(strList) == 0
+	// if storage has no versions, and the repo was deleted/not-found, we know for sure
+	// there are no versions that Athens can serve, so just return an error.
 	if isRepoNotFoundErr && storageEmpty {
 		return nil, errors.E(op, errors.M(mod), errors.KindNotFound, goErr)
 	}
